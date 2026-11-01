@@ -2101,6 +2101,21 @@
       "anima": true
     },
     {
+      "id": "gate-portal-redact",
+      "label": "portal-redact (loot mask)",
+      "category": "cascade-infra",
+      "kind": "gate",
+      "cmd": "node",
+      "args": [
+        "tools/anima-host/portalredact-check.mjs"
+      ],
+      "verifies": "",
+      "nl": false,
+      "lang": "both",
+      "in_gate": true,
+      "anima": true
+    },
+    {
       "id": "gate-ducky-payloads",
       "label": "ducky (payloads)",
       "category": "security",

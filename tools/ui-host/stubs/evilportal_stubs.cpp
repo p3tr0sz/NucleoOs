@@ -53,6 +53,27 @@ bool          nucleo_evilportal_twin_coherent(void)  { return false; }
 int           nucleo_evilportal_twin_channel(void)   { return 0; }
 unsigned long nucleo_evilportal_deauth_frames(void)  { return 0; }
 
+// ---- loot password redaction (Bruce parity) --------------------------------
+static int g_pwd_mode = 0;
+void        nucleo_evilportal_set_pwd_mode(int m) { g_pwd_mode = (m < 0 || m > 3) ? 0 : m; }
+int         nucleo_evilportal_pwd_mode(void)      { return g_pwd_mode; }
+const char *nucleo_evilportal_pwd_mode_name(int m) {
+    switch (m) { case 1: return "masked"; case 2: return "hidden"; case 3: return "length"; default: return "full"; }
+}
+
+// ---- selectable gateway (#7) -----------------------------------------------
+static char g_gw[16] = "192.168.4.1";
+void        nucleo_evilportal_set_gateway(const char *ip) { if (ip) snprintf(g_gw, sizeof g_gw, "%s", ip); }
+const char *nucleo_evilportal_gateway(void) { return g_gw; }
+
+// ---- captured-password verification (#1) -----------------------------------
+static bool g_verify = false;
+void nucleo_evilportal_set_verify(bool on) { g_verify = on; }
+bool nucleo_evilportal_verify_enabled(void) { return g_verify; }
+int  nucleo_evilportal_verified_ok(void)  { return 1; }
+int  nucleo_evilportal_verified_bad(void) { return 0; }
+bool nucleo_evilportal_verifying(void)    { return false; }
+
 // The RUNNING screen frees the shared canvas on the device; host no-ops.
 void nucleo_screen_release(void) {}
 bool nucleo_screen_acquire(void) { return true; }

@@ -60,6 +60,7 @@
     "probe:test": "node tools/anima-host/probe-check.mjs",
     "eapol:test": "node tools/anima-host/eapol-check.mjs",
     "portalclone:test": "node tools/anima-host/portalclone-check.mjs",
+    "portalredact:test": "node tools/anima-host/portalredact-check.mjs",
     "evilportal:test": "node tools/anima-host/evilportal-fingerprint-check.mjs",
     "ducky:test": "node tools/anima-host/ducky-check.mjs",
     "take:test": "node tools/anima-host/take-check.mjs",

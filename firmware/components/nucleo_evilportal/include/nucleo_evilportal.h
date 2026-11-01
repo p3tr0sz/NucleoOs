@@ -100,6 +100,35 @@ bool        nucleo_evilportal_dhcps_ok(void);
 void        nucleo_evilportal_set_debug(bool on);
 bool        nucleo_evilportal_debug(void);
 
+// ---- loot password redaction (Bruce parity) --------------------------------
+// How a captured password is written to SD and shown in the live UI: 0=full, 1=masked ("p****d"),
+// 2=hidden ("*hidden*"), 3=length only ("8 chars"). See EP_PWD_* in nucleo_evilportal_redact.h.
+// The mode persists in NVS across reboots. It NEVER affects the internal confirm-match (which always
+// compares the raw secret) — only what is stored/shown. Toggled from the app's TAB menu.
+void        nucleo_evilportal_set_pwd_mode(int mode);
+int         nucleo_evilportal_pwd_mode(void);
+const char *nucleo_evilportal_pwd_mode_name(int mode);   // short label for the app UI
+
+// ---- selectable captive gateway / AP IP (Bruce parity) ---------------------
+// The captive AP's own IP (and the IP every DNS lookup + login/redirect URL resolves to). Default
+// 192.168.4.1; 172.0.0.1 is the common alternative. Set BEFORE arming (no-op while running). `ip`
+// must be a dotted IPv4 quad; an invalid string is ignored and the previous value kept.
+void        nucleo_evilportal_set_gateway(const char *ip);
+const char *nucleo_evilportal_gateway(void);
+
+// ---- captured-password verification against the real AP (Bruce parity, #1) --
+// EXPERIMENTAL / twin-mode only. When enabled AND armed as an evil twin of an ENCRYPTED real AP, each
+// captured secret is treated as a candidate Wi-Fi PSK and tried against the real BSSID on its own
+// channel (a brief one-shot STA join on a dedicated task; the twin deauth is paused for the attempt).
+// A successful association marks that capture "valid" in the loot and bumps the valid counter. Does
+// nothing in decoy mode, for an OPEN/PMF real AP, or when off. Set BEFORE arming; off by default.
+// NOTE: the actual join behaviour must be validated on hardware — it cannot be exercised on the host.
+void        nucleo_evilportal_set_verify(bool on);
+bool        nucleo_evilportal_verify_enabled(void);
+int         nucleo_evilportal_verified_ok(void);   // captures whose PSK associated to the real AP
+int         nucleo_evilportal_verified_bad(void);  // captures whose PSK was rejected
+bool        nucleo_evilportal_verifying(void);     // a join attempt is in flight right now
+
 // Captures-per-minute rolling window (6 slots × 10 s, newest first). For a mini
 // bar chart on the 320x240 panel.
 #define NUCLEO_EP_RATE_SLOTS 6

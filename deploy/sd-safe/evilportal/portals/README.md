@@ -14,8 +14,17 @@ Percorso sul device: `/sd/evilportal/portals/`.
   account/tel/...` = utente. Tutto il resto è comunque salvato grezzo.
 - `{{SSID}}` viene sostituito a runtime col SSID realmente trasmesso.
 
+## Organizzazione per lingua (sottocartelle)
+Oltre ai `*.html` in questa cartella, l'engine elenca anche i `*.html` **un livello sotto**, in
+sottocartelle per lingua: `portals/en/airport.html` compare come `en/airport`, `portals/pt-br/...`
+come `pt-br/...`. La cartella `a/` (asset dei cloni live) è esclusa. I file flat continuano a
+funzionare: le sottocartelle servono solo a tenere ordinati pacchetti per lingua.
+
+I template in `en/` qui inclusi sono archetipi **generici** (aeroporto, bar, conferenza, centro
+commerciale, coworking) — non imitano un brand reale. Per cloni brand-accurate usa il clone live
+(F1) da un target autorizzato oppure il generatore LLM `tools/evilportal/generate.mjs`.
+
 ## Aggiungere un clone
-Copia un `.html` qui e risincronizza la SD (`tools/sd-sync.ps1`). Per cloni brand-accurate,
-salva la pagina reale e rendila self-contained (asset inline).
+Copia un `.html` qui (o in una sottocartella lingua) e risincronizza la SD (`tools/sd-sync.ps1`).
 
 Le catture finiscono in `/sd/evilportal/loot/` (una CSV per sessione + `all-credentials.csv`).

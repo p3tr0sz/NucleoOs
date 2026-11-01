@@ -47,6 +47,16 @@ const char *nucleo_evilportal_recent_user(int i);
 const char *nucleo_evilportal_recent_pass(int i);
 void        nucleo_evilportal_set_debug(bool on);   // opt-in SD diagnostics (ep-debug.log); off by default
 bool        nucleo_evilportal_debug(void);
+void        nucleo_evilportal_set_pwd_mode(int mode);  // loot redaction: 0 full/1 masked/2 hidden/3 length
+int         nucleo_evilportal_pwd_mode(void);
+const char *nucleo_evilportal_pwd_mode_name(int mode);
+void        nucleo_evilportal_set_gateway(const char *ip);   // #7 selectable captive AP IP (before arm)
+const char *nucleo_evilportal_gateway(void);
+void        nucleo_evilportal_set_verify(bool on);           // #1 verify captured PSK vs real AP (twin only)
+bool        nucleo_evilportal_verify_enabled(void);
+int         nucleo_evilportal_verified_ok(void);
+int         nucleo_evilportal_verified_bad(void);
+bool        nucleo_evilportal_verifying(void);
 // Fingerprint + mini rate window (letal dashboard on the 320x240 panel).
 #define NUCLEO_EP_VENDOR_N 6
 #define NUCLEO_EP_RATE_SLOTS 6
@@ -106,6 +116,8 @@ static int s_lg_scroll = 0;   // panel list scroll (one list visible at a time)
 enum {
     ST_CONSENT, ST_HOME, ST_TARGETS, ST_KARMA, ST_SSID, ST_TYPE, ST_PAGE, ST_SETUP,
     ST_RUNNING, ST_LOOT, ST_GUIDE, ST_LURE, ST_SCAN, ST_KARMA_SCAN, ST_CLONE, ST_STOPPING,
+    ST_GW,       // #7: captive gateway/AP-IP picker (two presets + manual entry)
+    ST_SETTINGS, // tunables submenu: diagnostics, password mode, gateway, auto-stop
 };
 // s_mode mirrors the engine's three flavours: 0 = Civetta (fake SSID), 1 = Gemello cattura (clone
 // OPEN + deauth), 2 = Gemello coerente (clone WPA2 security, no login). HOME picks Civetta/Gemello;
@@ -121,6 +133,14 @@ static int  s_ssid_idx, s_tpl_idx;       // SSID preset / page template
 static int  s_ssid_n, s_tpl_n;           // cached catalog sizes
 static char s_custom[33];                // typed SSID (overrides preset when non-empty)
 static int  s_typelen;
+static int  s_type_target;               // what ST_TYPE is editing: 0 = SSID (s_custom), 1 = gateway (s_gwtype)
+static char s_gw_sel[16] = "192.168.4.1";// #7: chosen captive gateway/AP IP (default .4.1; alt 172.0.0.1)
+static char s_gwtype[16];                // manual-entry buffer for ST_TYPE when s_type_target == 1
+static bool s_auto;                      // #6 auto-stop: terminate the portal if idle, extend on activity
+static bool s_auto_extended;             // one-way flag: flipped once a client/capture appears this run
+static bool s_verify;                    // #1 verify captured PSK against the real AP (twin + encrypted)
+#define AUTO_BASE_S 15                   // stop after this long with nobody connected (Bruce default)
+#define AUTO_EXT_S  60                   // ...extended to this once activity is seen
 static char s_err[40];
 static bool s_scan_armed, s_karma_armed, s_karma_started, s_clone_armed, s_stop_armed;
 static uint32_t s_last_refresh;
@@ -184,6 +204,8 @@ static void set_hint(void)
         case ST_SSID:      nucleo_app_set_hint(TR5("su/giu   invio scegli   esc indietro", "up/dn   enter pick   esc back", "arriba/ab intro elige  esc atras", "haut/bas intro choisir  esc ret", "auf/ab enter waehlen   esc zurck")); break;
         case ST_TYPE:      nucleo_app_set_hint(TR5("scrivi   invio ok   canc   esc indietro", "type   enter ok   del   esc back", "escribe intro ok borra   esc atras", "tape ok suppr   esc retour", "schreib enter ok del   esc zurueck")); break;
         case ST_PAGE:      nucleo_app_set_hint(TR5("su/giu   invio scegli   esc indietro", "up/dn   enter pick   esc back", "arriba/ab intro elige  esc atras", "haut/bas intro choisir  esc ret", "auf/ab enter waehlen   esc zur")); break;
+        case ST_GW:        nucleo_app_set_hint(TR5("su/giu   invio scegli   esc indietro", "up/dn   enter pick   esc back", "arriba/ab intro elige  esc atras", "haut/bas intro choisir  esc ret", "auf/ab enter waehlen   esc zur")); break;
+        case ST_SETTINGS:  nucleo_app_set_hint(TR5("su/giu   invio cambia   esc indietro", "up/dn   enter change   esc back", "arriba/ab intro cambia  esc atras", "haut/bas intro change  esc ret", "auf/ab enter aendern   esc zur")); break;
         case ST_SETUP:     nucleo_app_set_hint(TR5("su/giu  invio modif  tab menu  esc", "up/dn  enter edit  tab menu  esc", "arriba/ab intro edita tab menu", "haut/bas intro edite tab menu esc", "auf/ab enter bearbeite tab menu")); break;
         case ST_RUNNING:   nucleo_app_set_hint(TR5("invio ferma  tab menu  esc lascia on", "enter stop  tab menu  esc leave on", "intro detiene   tab menu   esc act", "ok arrete   tab menu   esc actif", "ok stoppe   tab menu   esc laeuft")); break;
         case ST_LOOT:      nucleo_app_set_hint(TR5("esc indietro", "esc back", "esc atras", "esc retour", "esc zurueck")); break;
@@ -220,6 +242,8 @@ static void enter(void)
 // ---- start --------------------------------------------------------------------
 static void start_portal(void)
 {
+    nucleo_evilportal_set_gateway(s_gw_sel);   // #7: apply the chosen captive AP IP before arming
+    nucleo_evilportal_set_verify(s_verify);    // #1: arm PSK verification (engine honors it only for twin+encrypted)
     int rc;
     if (s_mode == 0) {
         rc = nucleo_evilportal_start(effective_ssid(), s_tpl_idx);
@@ -230,7 +254,7 @@ static void start_portal(void)
                                           nucleo_wifiatk_target_channel(s_ap_idx),
                                           nucleo_wifiatk_target_authmode(s_ap_idx), s_mode == 2);
     }
-    if (rc == 0) { s_err[0] = 0; go(ST_RUNNING); }
+    if (rc == 0) { s_err[0] = 0; s_auto_extended = false; go(ST_RUNNING); }
     else { snprintf(s_err, sizeof s_err, TR("Avvio fallito (err %d)","Start failed (err %d)"), rc); set_hint(); nucleo_app_request_draw(); }
 }
 
@@ -311,6 +335,13 @@ static void tick(void)
         return;
     }
     if (s_state != ST_RUNNING && s_state != ST_LURE) return;
+    // #6 Auto-stop: if enabled, disarm the portal once it has been idle past the base window. Any
+    // client or capture extends the deadline (one-way) to AUTO_EXT_S — Bruce's base/extend behaviour.
+    if (s_auto && s_state == ST_RUNNING && nucleo_evilportal_running()) {
+        if (nucleo_evilportal_captures() > 0 || nucleo_evilportal_clients() > 0) s_auto_extended = true;
+        unsigned lim = s_auto_extended ? AUTO_EXT_S : AUTO_BASE_S;
+        if (nucleo_evilportal_uptime_s() >= lim) { s_stop_armed = false; go(ST_STOPPING); return; }
+    }
     uint32_t t = (uint32_t)(esp_timer_get_time() / 1000000);
     if (t != s_last_refresh) { s_last_refresh = t; s_pulse = !s_pulse; nucleo_app_request_draw(); }
 }
@@ -386,18 +417,57 @@ static void get_loot(int i, char *name, int nc, char *val, int vc, unsigned shor
     snprintf(name, nc, "%.18s", nucleo_evilportal_recent_user(i));
     snprintf(val, vc, "%.12s", nucleo_evilportal_recent_pass(i)); *dot = EP_RED;
 }
+// #7 gateway picker: two presets (192.168.4.1 first) + a manual-entry row. 3 rows.
+static const char *GW_PRESETS[] = { "192.168.4.1", "172.0.0.1" };
+#define GW_NPRESET 2
+#define GW_NROWS   3
+static void get_gw(int i, char *name, int nc, char *val, int vc, unsigned short *dot)
+{
+    if (i < GW_NPRESET) {
+        snprintf(name, nc, "%s", GW_PRESETS[i]);
+        if (!strcmp(GW_PRESETS[i], s_gw_sel)) snprintf(val, vc, "%s", TR("attuale","current")); else val[0] = 0;
+        *dot = GRN; return;
+    }
+    snprintf(name, nc, "%s", TR("Scrivi a mano...","Type manually..."));
+    // show the custom value if the active gw isn't one of the presets
+    if (strcmp(s_gw_sel, GW_PRESETS[0]) && strcmp(s_gw_sel, GW_PRESETS[1])) snprintf(val, vc, "%.12s", s_gw_sel); else val[0] = 0;
+    *dot = EP_CYAN;
+}
+// Settings submenu rows: Diagnostics / Password mode / Gateway / Auto-stop. A scrolling list, so it
+// holds as many tunables as we like without the overlay-size limits of the TAB menu.
+#define SET_NROWS 5
+static const char *pwd_mode_label_short(void)
+{
+    const char *m = nucleo_evilportal_pwd_mode_name(nucleo_evilportal_pwd_mode());
+    return !strcmp(m, "masked") ? TR("mascher.","masked") : !strcmp(m, "hidden") ? TR("nascosta","hidden")
+         : !strcmp(m, "length") ? TR("lunghezza","length") : TR("intera","full");
+}
+static void get_settings(int i, char *name, int nc, char *val, int vc, unsigned short *dot)
+{
+    switch (i) {
+        case 0: snprintf(name, nc, "%s", TR("Diagnostica","Diagnostics"));
+                snprintf(val, vc, "%s", nucleo_evilportal_debug() ? "ON" : "OFF");
+                *dot = nucleo_evilportal_debug() ? GRN : DIM; break;
+        case 1: snprintf(name, nc, "%s", TR("Password loot","Loot password"));
+                snprintf(val, vc, "%s", pwd_mode_label_short());
+                *dot = nucleo_evilportal_pwd_mode() ? YEL : DIM; break;
+        case 2: snprintf(name, nc, "%s", TR("Gateway","Gateway"));
+                snprintf(val, vc, "%.14s", s_gw_sel); *dot = EP_CYAN; break;
+        case 3: snprintf(name, nc, "%s", TR("Auto-stop","Auto-stop"));
+                if (s_auto) snprintf(val, vc, "%d>%ds", AUTO_BASE_S, AUTO_EXT_S); else snprintf(val, vc, "OFF");
+                *dot = s_auto ? GRN : DIM; break;
+        default: snprintf(name, nc, "%s", TR("Verifica pwd","Verify pwd"));   // #1 twin-only; experimental
+                snprintf(val, vc, "%s", s_verify ? "ON" : "OFF"); *dot = s_verify ? GRN : DIM; break;
+    }
+}
 
 // TAB options menu (context-sensitive).
-// Diagnostics toggle label reflects the live flag. Last item in both menu variants.
-static const char *menu_diag_label(void)
-{
-    return nucleo_evilportal_debug() ? TR("Diagnostica: ON","Diagnostics: ON")
-                                     : TR("Diagnostica: OFF","Diagnostics: OFF");
-}
+// The TAB menu stays small (fits the overlay on both screens): the tunables live in a scrolling
+// Settings submenu (ST_SETTINGS) instead. Running: Loot/Stop/Guide/Settings. Idle: Loot/Guide/Settings.
 static const char *menu_item(int i)
 {
-    if (nucleo_evilportal_running()) { const char *R[] = { TR("Loot catture","Loot captures"), TR("Ferma portale","Stop portal"), TR("Guida","Guide"), menu_diag_label() }; return R[i]; }
-    const char *N[] = { TR("Loot catture","Loot captures"), TR("Guida","Guide"), menu_diag_label() }; return N[i];
+    if (nucleo_evilportal_running()) { const char *R[] = { TR("Loot catture","Loot captures"), TR("Ferma portale","Stop portal"), TR("Guida","Guide"), TR("Impostazioni","Settings") }; return R[i]; }
+    const char *N[] = { TR("Loot catture","Loot captures"), TR("Guida","Guide"), TR("Impostazioni","Settings") }; return N[i];
 }
 static int menu_count(void) { return nucleo_evilportal_running() ? 4 : 3; }
 static const char *menu_title(void) { return nucleo_evilportal_running() ? TR("PORTALE ATTIVO","PORTAL ACTIVE") : "MENU"; }
@@ -455,7 +525,7 @@ static void draw_setup(int h)
     const char *badge = s_mode == 0 ? TR("CIVETTA","DECOY") : s_mode == 1 ? TR("GEMELLO","TWIN") : TR("COERENTE","MATCHED");
     app_ui_title(TR("Configura","Configure"), EP_RED, badge);
     for (int i = 0; i < s_nrows; i++) {
-        int y = 22 + i * 19; bool s = (i == s_sel);
+        int y = 22 + i * 23; bool s = (i == s_sel);
         char val[40];
         switch (s_rows[i]) {
             case R_SSID: snprintf(val, sizeof val, "%s%s", effective_ssid(), s_custom[0] ? " *" : "");
@@ -483,10 +553,12 @@ static void draw_setup(int h)
 
 static void draw_type(int h)
 {
-    app_ui_title(TR("Nome rete","Network name"), EP_RED, "");
-    d.setTextSize(1); d.setTextColor(MUTED, BG); d.setCursor(10, 28); d.print(TR("Scrivi l'SSID civetta:","Type the decoy SSID:"));
+    bool gw = (s_type_target == 1);
+    app_ui_title(gw ? TR("Gateway IP","Gateway IP") : TR("Nome rete","Network name"), EP_RED, "");
+    d.setTextSize(1); d.setTextColor(MUTED, BG); d.setCursor(10, 28);
+    d.print(gw ? TR("Scrivi l'IP del captive:","Type the captive IP:") : TR("Scrivi l'SSID civetta:","Type the decoy SSID:"));
     d.drawRect(8, 44, 224, 20, LINE);
-    d.setTextSize(2); d.setTextColor(FG, BG); d.setCursor(12, 47); d.print(s_custom);
+    d.setTextSize(2); d.setTextColor(FG, BG); d.setCursor(12, 47); d.print(gw ? s_gwtype : s_custom);
     if (s_pulse) { int cx = 12 + s_typelen * 12; d.fillRect(cx, 47, 9, 14, EP_RED); }
     (void)h;
 }
@@ -530,6 +602,14 @@ static void draw_running(int h)
     int conf = nucleo_evilportal_confirmed();
     if (conf > 0) { char cf[12]; snprintf(cf, sizeof cf, "conf %d", conf); d.setTextSize(1);
                     d.setTextColor(GRN, BG); d.setCursor(178 - (int)strlen(cf) * 3, 74); d.print(cf); }
+    // #1 verify (twin+encrypted): show ok/bad tallies, or a live "..." while a join is in flight.
+    if (nucleo_evilportal_verify_enabled()) {
+        char vf[16];
+        if (nucleo_evilportal_verifying()) snprintf(vf, sizeof vf, "PSK...");
+        else snprintf(vf, sizeof vf, "PSK %d/%d", nucleo_evilportal_verified_ok(), nucleo_evilportal_verified_bad());
+        d.setTextSize(1); d.setTextColor(nucleo_evilportal_verified_ok() ? GRN : MUTED, BG);
+        d.setCursor(10, 74); d.print(vf);
+    }
     d.drawFastHLine(10, 84, 220, LINE);
     // The loot band is the only DIRECT-path field that can SHRINK or swap (placeholder <-> captured
     // creds), so clear its box only when it actually changes — re-clearing it on every 1 Hz repaint
@@ -641,6 +721,19 @@ static void lg_page_row(int i, int x, int y, int w, int h, bool focus, unsigned 
 static void lg_loot_row(int i, int x, int y, int w, int h, bool focus, unsigned short bg, void *) {
     lg::row_text(x, y, w, h, focus, bg, nucleo_evilportal_recent_user(i), nucleo_evilportal_recent_pass(i), focus ? INK : FG);
 }
+static void lg_gw_row(int i, int x, int y, int w, int h, bool focus, unsigned short bg, void *) {
+    if (i < GW_NPRESET) {
+        const char *cur = !strcmp(GW_PRESETS[i], s_gw_sel) ? TR("attuale","current") : nullptr;
+        lg::row_text(x, y, w, h, focus, bg, GW_PRESETS[i], cur, focus ? INK : FG); return;
+    }
+    const char *cust = (strcmp(s_gw_sel, GW_PRESETS[0]) && strcmp(s_gw_sel, GW_PRESETS[1])) ? s_gw_sel : nullptr;
+    lg::row_text(x, y, w, h, focus, bg, TR("Scrivi a mano...","Type manually..."), cust, focus ? INK : EP_CYAN);
+}
+static void lg_settings_row(int i, int x, int y, int w, int h, bool focus, unsigned short bg, void *) {
+    char nm[28] = "", vl[20] = ""; unsigned short dot = FG;
+    get_settings(i, nm, sizeof nm, vl, sizeof vl, &dot);
+    lg::row_text(x, y, w, h, focus, bg, nm, vl, focus ? INK : dot);
+}
 static void lg_tgt_row(int i, int x, int y, int w, int h, bool focus, unsigned short bg, void *) {
     char right[18]; snprintf(right, sizeof right, "c%d %ddB", nucleo_wifiatk_target_channel(i), nucleo_wifiatk_target_rssi(i));
     const char *ss = nucleo_wifiatk_target_ssid(i);
@@ -710,11 +803,13 @@ static void draw_large(void) {
         lg::button(dx + 8, Hp - 50, dw - 16, 34, TR("Apri", "Open"), EP_RED, INK, NK_ENTER, 0);
         nucleo_touch_commit(); return;
     }
-    if (s_state == ST_SSID || s_state == ST_PAGE || s_state == ST_LOOT || s_state == ST_TARGETS || s_state == ST_KARMA) {
+    if (s_state == ST_SSID || s_state == ST_PAGE || s_state == ST_GW || s_state == ST_SETTINGS || s_state == ST_LOOT || s_state == ST_TARGETS || s_state == ST_KARMA) {
         const char *title; int n; int sel; lg::row_fn fn; const char *empty;
         switch (s_state) {
             case ST_SSID:    title = TR("SSID civetta", "Decoy SSID"); n = s_ssid_n + 1; sel = s_sel; fn = lg_ssid_row; empty = ""; break;
             case ST_PAGE:    title = TR("Pagina login", "Login page"); n = s_tpl_n; sel = s_sel; fn = lg_page_row; empty = TR("nessun template", "no template"); break;
+            case ST_GW:      title = TR("Gateway IP", "Gateway IP"); n = GW_NROWS; sel = s_sel; fn = lg_gw_row; empty = ""; break;
+            case ST_SETTINGS:title = TR("Impostazioni", "Settings"); n = SET_NROWS; sel = s_sel; fn = lg_settings_row; empty = ""; break;
             case ST_TARGETS: title = TR("Reti vicine", "Nearby networks"); n = s_ap_n; sel = s_ap_idx; fn = lg_tgt_row; empty = TR("premi R per scansionare", "press R to scan"); break;
             case ST_KARMA:   title = TR("Reti cercate", "Probed networks"); n = nucleo_wifiatk_karma_count(); sel = s_km_sel; fn = lg_tgt_row; empty = TR("nessuna probe", "no probes"); break;
             default:         title = "Loot"; n = nucleo_evilportal_recent_count(); sel = s_sel; fn = lg_loot_row; empty = TR("ancora nulla", "nothing yet"); break;
@@ -726,11 +821,14 @@ static void draw_large(void) {
         nucleo_touch_commit(); return;
     }
     if (s_state == ST_TYPE) {
-        int y = lg::header(TR("Nome rete", "Network name"), nullptr, EP_RED, NK_BACK);
+        bool gw = (s_type_target == 1);
+        int y = lg::header(gw ? TR("Gateway IP", "Gateway IP") : TR("Nome rete", "Network name"), nullptr, EP_RED, NK_BACK);
         d.fillRect(0, y, Wp, Hp - y, BG);
-        lg::font(0); d.setTextColor(MUTED, BG); d.drawString(TR("Scrivi l'SSID civetta sul Cardputer:", "Type the decoy SSID on the Cardputer:"), 16, y + 12);
+        lg::font(0); d.setTextColor(MUTED, BG);
+        d.drawString(gw ? TR("Scrivi l'IP del captive sul Cardputer:", "Type the captive IP on the Cardputer:")
+                        : TR("Scrivi l'SSID civetta sul Cardputer:", "Type the decoy SSID on the Cardputer:"), 16, y + 12);
         d.fillRoundRect(12, y + 34, Wp - 24, 44, 8, INK); d.drawRoundRect(12, y + 34, Wp - 24, 44, 8, EP_RED);
-        char shown[40]; snprintf(shown, sizeof shown, "%s_", s_custom); char f[40]; lg::font(2); lg::fit(f, sizeof f, shown, Wp - 48);
+        char shown[40]; snprintf(shown, sizeof shown, "%s_", gw ? s_gwtype : s_custom); char f[40]; lg::font(2); lg::fit(f, sizeof f, shown, Wp - 48);
         d.setTextColor(FG, INK); d.setTextDatum(middle_left); d.drawString(f, 24, y + 56); d.setTextDatum(top_left);
         nucleo_touch_commit(); return;
     }
@@ -961,6 +1059,8 @@ static void draw(void)
         case ST_SSID:    ui_list(TR("SSID civetta","Decoy SSID"), "", s_ssid_n + 1, s_sel, get_ssid, "", nullptr); break;
         case ST_TYPE:    draw_type(h); break;
         case ST_PAGE:    ui_list(TR("Pagina login","Login page"), "", s_tpl_n, s_sel, get_page, TR("nessun template","no template"), nullptr); break;
+        case ST_GW:      ui_list(TR("Gateway IP","Gateway IP"), "", GW_NROWS, s_sel, get_gw, "", TR("IP del captive/AP","captive/AP IP")); break;
+        case ST_SETTINGS: ui_list(TR("Impostazioni","Settings"), "", SET_NROWS, s_sel, get_settings, "", TR("invio: cambia","enter: change")); break;
         case ST_SETUP:   draw_setup(h); break;
         case ST_RUNNING: draw_running(h); break;
         case ST_LURE:    draw_lure(h); break;
@@ -1002,10 +1102,10 @@ static void menu_choose(void)
     //   running     -> [Loot, Stop, Guide, Diag]
     //   not running -> [Loot, Guide, Diag]
     int sel = s_menu_sel;
-    int diag_idx = run ? 3 : 2;
+    int settings_idx = run ? 3 : 2;
     if (sel == 0)                 { s_ret = s_state; go(ST_LOOT); }
     else if (run && sel == 1)     { s_stop_armed = false; go(ST_STOPPING); }
-    else if (sel == diag_idx)     { nucleo_evilportal_set_debug(!nucleo_evilportal_debug()); set_hint(); nucleo_app_request_draw(); }
+    else if (sel == settings_idx) { s_ret = s_state; go(ST_SETTINGS); }
     else                          { s_ret = s_state; go(ST_GUIDE); }
 }
 static bool ep_back(int key)
@@ -1014,7 +1114,9 @@ static bool ep_back(int key)
     if (s_menu) { s_menu = false; set_hint(); nucleo_app_force_repaint(); return true; }   // erase the overlay box (DIRECT path)
     switch (s_state) {
         case ST_SSID: case ST_PAGE: go(ST_SETUP); return true;
-        case ST_TYPE: go(ST_SSID); return true;
+        case ST_GW: go(ST_SETTINGS); return true;
+        case ST_SETTINGS: go(s_ret ? s_ret : ST_HOME); return true;
+        case ST_TYPE: go(s_type_target == 1 ? ST_GW : ST_SSID); return true;
         case ST_SETUP: case ST_TARGETS: case ST_KARMA: go(ST_HOME); return true;
         case ST_LURE: nucleo_wifiatk_beacon_stop(); go(ST_HOME); return true;
         case ST_LOOT: case ST_GUIDE: go(s_ret ? s_ret : ST_HOME); return true;
@@ -1047,6 +1149,8 @@ static void on_key(int key, char ch)
             case ST_SETUP:   if (i < s_nrows)       { s_sel = i; on_key(NK_ENTER, 0); } return;
             case ST_SSID:    if (i < s_ssid_n + 1)  { s_sel = i; on_key(NK_ENTER, 0); } return;
             case ST_PAGE:    if (i < s_tpl_n)       { s_sel = i; on_key(NK_ENTER, 0); } return;
+            case ST_GW:      if (i < GW_NROWS)      { s_sel = i; on_key(NK_ENTER, 0); } return;
+            case ST_SETTINGS:if (i < SET_NROWS)     { s_sel = i; on_key(NK_ENTER, 0); } return;
             case ST_TARGETS: if (i < s_ap_n)        { s_ap_idx = i; on_key(NK_ENTER, 0); } return;
             case ST_KARMA:   if (i < nucleo_wifiatk_karma_count()) { s_km_sel = i; on_key(NK_ENTER, 0); } return;
             default: return;
@@ -1097,11 +1201,39 @@ static void on_key(int key, char ch)
                 else { s_ssid_idx = s_sel - 1; s_custom[0] = 0; go(ST_SETUP); }
             }
             return;
-        case ST_TYPE:
-            if (key == NK_ENTER) { go(ST_SETUP); }
-            else if (key == NK_DEL) { if (s_typelen > 0) s_custom[--s_typelen] = 0; nucleo_app_request_draw(); }
-            else if (ch >= 32 && ch < 127 && s_typelen < 32) { s_custom[s_typelen++] = ch; s_custom[s_typelen] = 0; nucleo_app_request_draw(); }
+        case ST_GW:
+            if (key == NK_UP || key == NK_DOWN) { list_nav(&s_sel, GW_NROWS, key); nucleo_app_request_draw(); }
+            else if (key == NK_ENTER) {
+                if (s_sel < GW_NPRESET) { snprintf(s_gw_sel, sizeof s_gw_sel, "%s", GW_PRESETS[s_sel]); go(ST_SETTINGS); }
+                else { s_type_target = 1; snprintf(s_gwtype, sizeof s_gwtype, "%s", s_gw_sel); s_typelen = strlen(s_gwtype); go(ST_TYPE); }
+            }
             return;
+        case ST_SETTINGS:
+            if (key == NK_UP || key == NK_DOWN) { list_nav(&s_sel, SET_NROWS, key); nucleo_app_request_draw(); }
+            else if (key == NK_ENTER) {
+                switch (s_sel) {
+                    case 0: nucleo_evilportal_set_debug(!nucleo_evilportal_debug()); break;
+                    case 1: nucleo_evilportal_set_pwd_mode((nucleo_evilportal_pwd_mode() + 1) % 4); break;
+                    case 2: go(ST_GW); return;                 // gateway has its own picker
+                    case 3: s_auto = !s_auto; break;
+                    default: s_verify = !s_verify; break;      // #1 experimental PSK verify (twin only)
+                }
+                set_hint(); nucleo_app_request_draw();
+            }
+            return;
+        case ST_TYPE: {
+            char *buf = (s_type_target == 1) ? s_gwtype : s_custom;
+            int cap = (s_type_target == 1) ? (int)sizeof(s_gwtype) - 1 : 32;
+            if (key == NK_ENTER) {
+                if (s_type_target == 1) {
+                    if (s_gwtype[0]) snprintf(s_gw_sel, sizeof s_gw_sel, "%s", s_gwtype);   // validated by the engine setter at arm
+                    s_type_target = 0; go(ST_GW);
+                } else go(ST_SETUP);
+            }
+            else if (key == NK_DEL) { if (s_typelen > 0) buf[--s_typelen] = 0; nucleo_app_request_draw(); }
+            else if (ch >= 32 && ch < 127 && s_typelen < cap) { buf[s_typelen++] = ch; buf[s_typelen] = 0; nucleo_app_request_draw(); }
+            return;
+        }
         case ST_PAGE:
             if (key == NK_UP || key == NK_DOWN) { list_nav(&s_sel, s_tpl_n, key); nucleo_app_request_draw(); }
             else if (key == NK_ENTER) { s_tpl_idx = s_sel; go(ST_SETUP); }

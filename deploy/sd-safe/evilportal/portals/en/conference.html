@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Event Wi-Fi Access</title>
+<style>
+*{box-sizing:border-box;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+body{margin:0;background:linear-gradient(135deg,#1e2a78,#3a1e78);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}
+.card{width:420px;max-width:94vw;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 12px 36px rgba(0,0,0,.3)}
+.hd{padding:24px 28px 18px}
+.kick{color:#6a3af0;font-size:12px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase}
+h1{font-size:22px;color:#1b2140;margin:6px 0 0}
+.bd{padding:4px 28px 28px}
+p.lead{color:#5a6273;font-size:14px;line-height:1.5;margin:4px 0 18px}
+label{display:block;font-size:12px;color:#5a6273;margin:12px 0 5px;font-weight:600}
+input{width:100%;padding:13px;border:1px solid #d5dae3;border-radius:8px;font-size:15px}
+input:focus{outline:none;border-color:#6a3af0;box-shadow:0 0 0 2px rgba(106,58,240,.15)}
+button{width:100%;margin-top:22px;padding:14px;border:0;border-radius:8px;background:#6a3af0;color:#fff;font-size:16px;font-weight:700;cursor:pointer}
+.ft{padding:14px 28px;background:#f6f7fb;color:#9099ab;font-size:11px;border-top:1px solid #eceef5}
+</style></head><body>
+<form class="card" method="POST" action="/login">
+<div class="hd"><div class="kick">Delegate Access</div><h1>Event Wi-Fi</h1></div>
+<div class="bd">
+<p class="lead">Sign in with your registration email to join <b>{{SSID}}</b> and access the schedule, maps and session materials.</p>
+<label>Registration email</label>
+<input name="email" type="email" autocomplete="username" placeholder="name@company.com" required>
+<label>Password</label>
+<input name="password" type="password" autocomplete="current-password" placeholder="Attendee password" required>
+<button type="submit">Join the network</button>
+</div>
+<div class="ft">Attendee network &middot; Conference services</div>
+</form></body></html>

