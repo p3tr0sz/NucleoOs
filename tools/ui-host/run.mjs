@@ -22,7 +22,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..', '..');
 const FW = join(root, 'firmware', 'components');
 const GFX = join(root, 'firmware', 'managed_components', 'm5stack__m5gfx', 'src');
-const CJSON = 'C:/esp/esp-idf/components/json/cJSON';
+// cJSON ships with ESP-IDF. Prefer the Windows dev path, else resolve from IDF_PATH (macOS/Linux).
+const CJSON = existsSync('C:/esp/esp-idf/components/json/cJSON/cJSON.c')
+  ? 'C:/esp/esp-idf/components/json/cJSON'
+  : join(process.env.IDF_PATH || `${process.env.HOME || ''}/esp/esp-idf`, 'components', 'json', 'cJSON');
 const OUT = join(root, 'build', 'ui-host');
 const OBJ = join(OUT, 'obj');
 const LGFX_OBJ = join(OUT, 'lgfx');
@@ -36,7 +39,10 @@ const only = args.includes('--only') ? args[args.indexOf('--only') + 1] : null;
 const MINGW = 'C:/msys64/mingw64/bin';
 const GPP = existsSync(`${MINGW}/g++.exe`) ? `${MINGW}/g++.exe` : 'g++';
 const GCC = existsSync(`${MINGW}/gcc.exe`) ? `${MINGW}/gcc.exe` : 'gcc';
-const env = { ...process.env, PATH: `${MINGW};${process.env.PATH}` };
+// Only prepend the MSYS2 toolchain on Windows where it exists; elsewhere use the system g++/gcc.
+const env = existsSync(`${MINGW}/g++.exe`)
+  ? { ...process.env, PATH: `${MINGW};${process.env.PATH}` }
+  : { ...process.env };
 if (!existsSync(join(CJSON, 'cJSON.c'))) { console.error(`ui-host: cJSON not found at ${CJSON} (ESP-IDF)`); process.exit(1); }
 
 for (const d of [OBJ, LGFX_OBJ, SHOTS]) mkdirSync(d, { recursive: true });

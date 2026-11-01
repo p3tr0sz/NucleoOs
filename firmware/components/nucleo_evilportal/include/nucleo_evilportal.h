@@ -92,6 +92,14 @@ int         nucleo_evilportal_probes_total(void);           // all captive-detec
 // red "DHCP KO" badge — the single most helpful diagnostic for the once-mysterious failure.
 bool        nucleo_evilportal_dhcps_ok(void);
 
+// ---- opt-in SD diagnostics -------------------------------------------------
+// When ON, the engine appends a timestamped trace of its start/DHCP path to
+// /sd/evilportal/ep-debug.log (heap + dhcps state + the spoofed SSID; NEVER a captured credential).
+// This is the no-serial-cable way to diagnose the "DHCP KO" / "Gathering IP" failure. OFF by
+// default; the flag persists in NVS across reboots. Toggled from the app's TAB menu.
+void        nucleo_evilportal_set_debug(bool on);
+bool        nucleo_evilportal_debug(void);
+
 // Captures-per-minute rolling window (6 slots × 10 s, newest first). For a mini
 // bar chart on the 320x240 panel.
 #define NUCLEO_EP_RATE_SLOTS 6

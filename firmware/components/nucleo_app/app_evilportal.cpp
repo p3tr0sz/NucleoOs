@@ -45,6 +45,8 @@ unsigned    nucleo_evilportal_uptime_s(void);
 int         nucleo_evilportal_recent_count(void);
 const char *nucleo_evilportal_recent_user(int i);
 const char *nucleo_evilportal_recent_pass(int i);
+void        nucleo_evilportal_set_debug(bool on);   // opt-in SD diagnostics (ep-debug.log); off by default
+bool        nucleo_evilportal_debug(void);
 // Fingerprint + mini rate window (letal dashboard on the 320x240 panel).
 #define NUCLEO_EP_VENDOR_N 6
 #define NUCLEO_EP_RATE_SLOTS 6
@@ -386,12 +388,18 @@ static void get_loot(int i, char *name, int nc, char *val, int vc, unsigned shor
 }
 
 // TAB options menu (context-sensitive).
+// Diagnostics toggle label reflects the live flag. Last item in both menu variants.
+static const char *menu_diag_label(void)
+{
+    return nucleo_evilportal_debug() ? TR("Diagnostica: ON","Diagnostics: ON")
+                                     : TR("Diagnostica: OFF","Diagnostics: OFF");
+}
 static const char *menu_item(int i)
 {
-    if (nucleo_evilportal_running()) { const char *R[] = { TR("Loot catture","Loot captures"), TR("Ferma portale","Stop portal"), TR("Guida","Guide") }; return R[i]; }
-    const char *N[] = { TR("Loot catture","Loot captures"), TR("Guida","Guide") }; return N[i];
+    if (nucleo_evilportal_running()) { const char *R[] = { TR("Loot catture","Loot captures"), TR("Ferma portale","Stop portal"), TR("Guida","Guide"), menu_diag_label() }; return R[i]; }
+    const char *N[] = { TR("Loot catture","Loot captures"), TR("Guida","Guide"), menu_diag_label() }; return N[i];
 }
-static int menu_count(void) { return nucleo_evilportal_running() ? 3 : 2; }
+static int menu_count(void) { return nucleo_evilportal_running() ? 4 : 3; }
 static const char *menu_title(void) { return nucleo_evilportal_running() ? TR("PORTALE ATTIVO","PORTAL ACTIVE") : "MENU"; }
 
 // ---- drawing -----------------------------------------------------------------
@@ -990,10 +998,14 @@ static void menu_choose(void)
     bool run = nucleo_evilportal_running();
     s_menu = false;
     // Dispatch by index, not label: the labels are localized (TR), so matching on text would break
-    // the moment the UI isn't Italian. Order mirrors menu_item(): running -> [Loot, Stop, Guide].
+    // the moment the UI isn't Italian. Order mirrors menu_item():
+    //   running     -> [Loot, Stop, Guide, Diag]
+    //   not running -> [Loot, Guide, Diag]
     int sel = s_menu_sel;
+    int diag_idx = run ? 3 : 2;
     if (sel == 0)                 { s_ret = s_state; go(ST_LOOT); }
     else if (run && sel == 1)     { s_stop_armed = false; go(ST_STOPPING); }
+    else if (sel == diag_idx)     { nucleo_evilportal_set_debug(!nucleo_evilportal_debug()); set_hint(); nucleo_app_request_draw(); }
     else                          { s_ret = s_state; go(ST_GUIDE); }
 }
 static bool ep_back(int key)
