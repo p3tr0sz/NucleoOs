@@ -20,6 +20,13 @@ if(NUCLEO_HOST_CC)
     else()
         set(_tts_exe_sfx "")
     endif()
+    # Apple clang non supporta il link statico di libc (ld: 'crt0.o' not found): l'exe gira comunque
+    # subito, in-build, quindi lo standalone non serve -> niente -static su macOS.
+    if(CMAKE_HOST_APPLE)
+        set(_tts_static_flag "")
+    else()
+        set(_tts_static_flag "-static")
+    endif()
     get_filename_component(_tts_ccdir "${NUCLEO_HOST_CC}" DIRECTORY)    # bin MinGW: serve sul PATH (vedi sotto)
     set(_tts_repo  "${CMAKE_CURRENT_SOURCE_DIR}/../../..")              # nucleo_tts -> components -> firmware -> repo
     set(_tts_plan  "${CMAKE_CURRENT_SOURCE_DIR}/nucleo_tts_plan.c")
@@ -37,7 +44,7 @@ if(NUCLEO_HOST_CC)
     add_custom_command(
         OUTPUT  "${_tts_stamp}"
         COMMAND "${CMAKE_COMMAND}" -E env "PATH=${_tts_ccdir}"
-                "${NUCLEO_HOST_CC}" -std=gnu11 -O0 -static
+                "${NUCLEO_HOST_CC}" -std=gnu11 -O0 ${_tts_static_flag}
                 -I "${CMAKE_CURRENT_SOURCE_DIR}/include" "${_tts_plan}" "${_tts_ctest}" -o "${_tts_exe}"
         COMMAND "${_tts_exe}"
         COMMAND "${CMAKE_COMMAND}" -E touch "${_tts_stamp}"

@@ -160,9 +160,9 @@ int main(void) {
 
     // --- dense formula -> say only the numeric RESULT (geometry/physics) ---
     char er[48];
-    chk("typo geo",     nucleo_tts_has_mathtypo("Area del cerchio = \xCF\x80\xC2\xB75\xC2\xB2 = 78.5398."));
+    chk("typo geo",     nucleo_tts_has_mathtypo("Area del cerchio = \xCF\x80\xC2\xB7" "5\xC2\xB2 = 78.5398."));
     chk("typo no-calc", !nucleo_tts_has_mathtypo("Il 20% di 150 = 30."));
-    chk("eq geo",       nucleo_tts_eq_result("Area del cerchio = \xCF\x80\xC2\xB75\xC2\xB2 = 78.5398.", er, sizeof er) && !strcmp(er, "78.5398"));
+    chk("eq geo",       nucleo_tts_eq_result("Area del cerchio = \xCF\x80\xC2\xB7" "5\xC2\xB2 = 78.5398.", er, sizeof er) && !strcmp(er, "78.5398"));
     chk("eq formula",  !nucleo_tts_eq_result("Area del cerchio: A = \xCF\x80\xC2\xB7r\xC2\xB2.", er, sizeof er));
     chk("eq unita",    !nucleo_tts_eq_result("v = s/t = 90000/3600 = 25 m/s.", er, sizeof er));
     chk("eq no-eq",    !nucleo_tts_eq_result("Fa 96.", er, sizeof er));

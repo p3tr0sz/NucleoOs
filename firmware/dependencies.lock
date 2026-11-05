@@ -9,6 +9,25 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.0.3
+  espressif/esp_new_jpeg:
+    component_hash: e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32s2
+    - esp32s3
+    - esp32s31
+    - esp32p4
+    - esp32c2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32c61
+    - esp32h4
+    version: 1.0.2
   espressif/esp_tinyusb:
     component_hash: 6a50305bc61c7a361da8c0833642be824e92dacb0a6001719a832a4e96e471bf
     dependencies:
@@ -34,7 +53,7 @@ dependencies:
       type: service
     version: 1.11.2
   espressif/tinyusb:
-    component_hash: a40b7f67df6ac254a4afd96c6401cc56f2059ae747d6d7e66b568bca53ad0edc
+    component_hash: 16c8d774dab1f484d3e0c0f61105624d2424bbae864efd19818baf7b451b41e7
     dependencies:
     - name: idf
       require: private
@@ -48,11 +67,11 @@ dependencies:
     - esp32p4
     - esp32h4
     - esp32s31
-    version: 0.19.0~3
+    version: 0.21.0~2
   idf:
     source:
       type: idf
-    version: 5.4.4
+    version: 5.4.0
   joltwallet/littlefs:
     component_hash: 01faa388c6305fe77fd6962cda6171e753033458f24f8fae9e9d932e3d817a4c
     dependencies:
@@ -72,10 +91,11 @@ dependencies:
     version: 0.2.23
 direct_dependencies:
 - chmorgan/esp-libhelix-mp3
+- espressif/esp_new_jpeg
 - espressif/esp_tinyusb
 - espressif/mdns
 - joltwallet/littlefs
 - m5stack/m5gfx
-manifest_hash: 5ea62430c077ecf60c980ede1154056b46d2f916ac54422cbec643e392c88186
+manifest_hash: 179effa6333242cea6107bfcc7073dceaeafad7b7aea8c6118b9ef80fb1f9e57
 target: esp32s3
 version: 2.0.0
